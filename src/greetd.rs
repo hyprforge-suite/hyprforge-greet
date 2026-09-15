@@ -77,13 +77,11 @@ pub enum GreetdError {
 
 /// What the UI thread asks the greetd thread to do.
 ///
-/// No `CancelSession`, deliberately. greetd cancels a session itself on
-/// error, so a failed password needs only another `CreateSession` — which
-/// is what `Conversation::retry` already does. The remaining use for
-/// cancelling is abandoning a *working* session to switch users, and
-/// there is no way to switch users yet: the screen shows a username but
-/// has no field for choosing one. Adding the request before the UI that
-/// needs it would be guessing at its shape.
+/// No `Ask::Cancel`, because cancelling is not something the UI ever asks
+/// for on its own: [`run`] sends `CancelSession` itself immediately
+/// before every `CreateSession`, so a retry cannot inherit a
+/// half-configured session from the attempt before it. See the comment
+/// there for what believing greetd's documentation on this cost.
 enum Ask {
     Start(String),
     Answer(Option<String>),
@@ -195,22 +193,61 @@ impl Backend for GreetdBackend {
     }
 }
 
+/// One request, one reply, on the socket.
+///
+/// Every write is paired with exactly one read and nothing else touches
+/// the stream in between, which is the property the whole module depends
+/// on — see [`run`] for what a missed reply would cost.
+fn exchange(stream: &mut UnixStream, request: Request) -> Result<Greetd, ()> {
+    request.write_to(stream).map_err(|_| ())?;
+    Greetd::read_from(stream).map_err(|_| ())
+}
+
 /// The greetd thread. Kept small: everything here can start a session.
 fn run(mut stream: UnixStream, asks: Receiver<Ask>, answers: Sender<Response>) {
     while let Ok(ask) = asks.recv() {
         let request = match ask {
-            Ask::Start(username) => Request::CreateSession { username },
+            Ask::Start(username) => {
+                // Cancel before creating, unconditionally, and ignore
+                // whatever comes back.
+                //
+                // greetd's own documentation says "the session is
+                // cancelled automatically on error", and this code
+                // believed it. On this machine it is not true of a
+                // failed password: one wrong attempt left the session
+                // half-configured, and every attempt after it — correct
+                // password included — came back "a session is already
+                // being configured". A single typo wedged the login
+                // screen until greetd was restarted from another VT,
+                // and the message blamed the session rather than saying
+                // "wrong password, try again".
+                //
+                // Cancelling first is correct whichever way greetd
+                // actually behaves: if it already cancelled there is
+                // nothing to cancel and it answers with an error nobody
+                // reads, and if it did not, this is what clears the way.
+                // It also cleans up after a *previous* greeter that
+                // died mid-conversation, which nothing did before.
+                //
+                // The reply is discarded rather than translated,
+                // because a failure to cancel is not a failure to log
+                // in: `CreateSession` below is what decides that, and
+                // reporting a cancel error would put a confusing
+                // sentence in front of someone whose password was
+                // about to work.
+                if exchange(&mut stream, Request::CancelSession).is_err() {
+                    let _ = answers.send(unreachable_service());
+                    return;
+                }
+                Request::CreateSession { username }
+            }
             Ask::Answer(response) => Request::PostAuthMessageResponse { response },
             Ask::Launch { command, environment } => {
                 Request::StartSession { cmd: command, env: environment }
             }
         };
 
-        if request.write_to(&mut stream).is_err() {
-            let _ = answers.send(unreachable_service());
-            return;
-        }
-        let Ok(reply) = Greetd::read_from(&mut stream) else {
+        let Ok(reply) = exchange(&mut stream, request) else {
             // Returning rather than trying again, and this is the
             // security-relevant part. A timed-out read leaves the
             // connection desynchronised: greetd's late answer to *this*
@@ -298,12 +335,45 @@ mod tests {
             let _dir = dir;
             let (mut stream, _) = listener.accept().expect("accept");
             let mut seen = Vec::new();
-            for reply in replies {
-                match Request::read_from(&mut stream) {
-                    Ok(request) => seen.push(request),
-                    Err(_) => break,
-                }
+            let mut replies = replies.into_iter();
+            // `ExactSizeIterator`, so `len()` below is the count remaining.
+            while let Ok(request) = Request::read_from(&mut stream) {
+                // `CancelSession` is answered by the harness rather than
+                // from the script, because the real greetd answers it
+                // whether or not there is anything to cancel — and the
+                // client now sends one before every `CreateSession`.
+                // Scripting it would mean every test here carrying a
+                // reply for a request it is not about, and the first
+                // test that forgot would fail somewhere unrelated.
+                //
+                // An error is what greetd gives for cancelling nothing,
+                // so that is what this gives, and it is the case the
+                // client must shrug off.
+                let is_cancel = matches!(request, Request::CancelSession);
+                seen.push(request);
+                let (reply, was_scripted) = if is_cancel {
+                    (
+                        Greetd::Error {
+                            error_type: ErrorType::Error,
+                            description: "no session to cancel".into(),
+                        },
+                        false,
+                    )
+                } else {
+                    match replies.next() {
+                        Some(reply) => (reply, true),
+                        None => break,
+                    }
+                };
                 if reply.write_to(&mut stream).is_err() {
+                    break;
+                }
+                // Stop once the script is spent, rather than blocking on
+                // a read that will never come. A harness that waits
+                // forever turns "the client asked one thing too few"
+                // into a hung test suite instead of a failed assertion,
+                // and a hang is far harder to read than a failure.
+                if was_scripted && replies.len() == 0 {
                     break;
                 }
             }
@@ -354,10 +424,71 @@ mod tests {
         // And the requests that actually went down the socket were the
         // ones greetd expects, in order.
         let seen = server.join().expect("server thread");
-        assert!(matches!(&seen[0], Request::CreateSession { username } if username == "apost"));
+        assert!(matches!(&seen[0], Request::CancelSession), "a stale session is cleared before asking for a new one");
+        assert!(matches!(&seen[1], Request::CreateSession { username } if username == "apost"));
         assert!(
-            matches!(&seen[1], Request::PostAuthMessageResponse { response } if response.as_deref() == Some("hunter2"))
+            matches!(&seen[2], Request::PostAuthMessageResponse { response } if response.as_deref() == Some("hunter2"))
         );
+    }
+
+    /// The bug that locked someone out of their own machine.
+    ///
+    /// greetd's documentation says "the session is cancelled
+    /// automatically on error", and this module believed it. On a real
+    /// machine it is not true of a failed password: one wrong attempt
+    /// left a half-configured session behind, and every attempt after
+    /// it — with the *correct* password — came back "a session is
+    /// already being configured". The login screen was wedged until
+    /// greetd was restarted from another VT.
+    ///
+    /// The fix is not to trust the answer either way: cancel before
+    /// every create, and this pins that a retry does so.
+    #[test]
+    fn a_retry_after_a_wrong_password_clears_the_session_first() {
+        let (stream, server) = fake_greetd(vec![
+            // The first attempt is asked for a password and told no.
+            Greetd::AuthMessage {
+                auth_message_type: AuthMessageType::Secret,
+                auth_message: "Password:".into(),
+            },
+            Greetd::Error {
+                error_type: ErrorType::AuthError,
+                description: "authentication failed".into(),
+            },
+            // The retry is asked again.
+            Greetd::AuthMessage {
+                auth_message_type: AuthMessageType::Secret,
+                auth_message: "Password:".into(),
+            },
+        ]);
+
+        let mut conversation = Conversation::new(GreetdBackend::over(stream), "apost");
+        settle(&mut conversation);
+        conversation.type_into("wrong".to_string());
+        conversation.submit();
+        settle(&mut conversation);
+        assert!(matches!(conversation.state(), State::Failed { .. }), "a wrong password fails");
+
+        conversation.retry();
+        settle(&mut conversation);
+
+        let seen = server.join().expect("the fake greetd thread");
+        let creates: Vec<usize> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, Request::CreateSession { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(creates.len(), 2, "one create for the first attempt and one for the retry");
+        for i in creates {
+            assert!(i > 0, "a CreateSession must never be the first thing sent");
+            assert!(
+                matches!(seen[i - 1], Request::CancelSession),
+                "every CreateSession must be preceded by a CancelSession; request {} was {:?}",
+                i - 1,
+                seen[i - 1]
+            );
+        }
     }
 
     /// greetd relays whatever PAM asks, which is not always a password.
@@ -405,9 +536,9 @@ mod tests {
 
         let seen = server.join().expect("server thread");
         assert!(
-            matches!(&seen[1], Request::PostAuthMessageResponse { response } if response.is_none()),
+            matches!(&seen[2], Request::PostAuthMessageResponse { response } if response.is_none()),
             "an info message must be answered with no response, got {:?}",
-            seen[1]
+            seen[2]
         );
     }
 
