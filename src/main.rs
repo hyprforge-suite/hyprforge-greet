@@ -15,7 +15,7 @@ mod greetd;
 
 use clap::Parser;
 use greetd::GreetdBackend;
-use hyprforge_authui::conversation::{Conversation, State};
+use hyprforge_authui::conversation::{self, Conversation, Press, State};
 use hyprforge_authui::Theme;
 use iced::keyboard::{key::Named, Key};
 use iced::{Element, Subscription, Task};
@@ -168,51 +168,42 @@ impl Greeter {
     }
 }
 
-/// One key, in the same terms the lock screen uses.
+/// One iced key press, in the terms `hyprforge-authui` understands.
 ///
-/// Free-standing and generic over the backend so it can be tested
-/// without a greetd socket. What reaches a password is the part worth
-/// testing: getting it wrong rejects a correctly typed password and
-/// spends a faillock attempt doing it.
+/// The grammar itself — what Enter means in each state, that Escape and
+/// Backspace dismiss a failed attempt, which text may reach the entry —
+/// is `conversation::apply_press`, shared with the lock screen. This
+/// function is only the translation, and it is the whole of what is
+/// host-specific.
+///
+/// It had been the grammar too, and the two copies drifted: the lock
+/// screen learned that Escape and Backspace must dismiss a failure and
+/// this one did not, so on the login screen both keys did nothing at
+/// all after "Incorrect password".
+///
+/// `text` rather than the key for characters: CLAUDE.md's rule, and the
+/// expensive one — reading the key turns `SHIFT + j` into `j`, so a
+/// password loses every capital and PAM rejects one typed correctly,
+/// spending a `pam_faillock` attempt each time.
 fn apply_key<B: hyprforge_authui::conversation::Backend>(
     conversation: &mut Conversation<B>,
     key: Key,
     text: Option<String>,
 ) {
-        match key {
-            Key::Named(Named::Enter) => match conversation.state() {
-                State::Telling { .. } => conversation.acknowledge(),
-                State::Failed { .. } => conversation.retry(),
-                _ => conversation.submit(),
-            },
-            Key::Named(Named::Escape) => conversation.clear(),
-            Key::Named(Named::Backspace) => {
-                let mut entered = conversation.typed().to_string();
-                entered.pop();
-                conversation.type_into(entered);
-            }
-            _ => {
-                let Some(text) = text else {
-                    return;
-                };
-                // Any key at all leaves the failed state, so someone can
-                // simply start typing again rather than work out which
-                // key dismisses the error.
-                if matches!(conversation.state(), State::Failed { .. }) {
-                    conversation.retry();
-                }
-                // Control characters would otherwise count as typed
-                // characters and show a dot for nothing — Enter and
-                // Backspace both produce text as well as being keys.
-                if !text.is_empty() && !text.chars().any(char::is_control) {
-                    let mut entered = conversation.typed().to_string();
-                    entered.push_str(&text);
-                    conversation.type_into(entered);
-                }
-            }
-        }
-    }
-
+    let press = match key {
+        Key::Named(Named::Enter) => Press::Enter,
+        Key::Named(Named::Escape) => Press::Escape,
+        Key::Named(Named::Backspace) => Press::Backspace,
+        _ => match text {
+            Some(text) => Press::Text(text),
+            // A key that produced nothing typable — a modifier, a
+            // function key — is not a press this prompt has a meaning
+            // for.
+            None => return,
+        },
+    };
+    conversation::apply_press(conversation, press);
+}
 
 fn main() -> iced::Result {
     // Defaulting to ERROR would silence every `warn!` here, and a greeter
@@ -324,6 +315,45 @@ mod tests {
 
     fn typing() -> Conversation<Asking> {
         Conversation::new(Asking(None), "apost")
+    }
+
+    /// A backend that fails whatever it is told, so the state after a
+    /// wrong password can be reached.
+    struct Rejecting(Option<Response>);
+    impl Backend for Rejecting {
+        fn start(&mut self, _username: &str) {
+            self.0 = Some(Response::Ask(Prompt::secret("Password:")));
+        }
+        fn answer(&mut self, _answer: &str) {
+            self.0 = Some(Response::Failure { reason: "Incorrect password".into() });
+        }
+        fn proceed(&mut self) {}
+        fn poll(&mut self) -> Option<Response> {
+            self.0.take()
+        }
+    }
+
+    /// Escape and Backspace must get a person out of a failed attempt.
+    ///
+    /// They did not: `clear` and `type_into` are both no-ops in
+    /// `Failed`, so on the login screen — the one screen where a frozen
+    /// response is frightening — the two keys anyone reaches for after
+    /// "Incorrect password" did nothing whatsoever. The lock screen had
+    /// already fixed this; the greeter's copy of the grammar had not,
+    /// which is why there is no longer a copy.
+    #[test]
+    fn escape_and_backspace_get_out_of_a_failed_attempt() {
+        for key in [Key::Named(Named::Escape), Key::Named(Named::Backspace)] {
+            let mut c = Conversation::new(Rejecting(None), "apost");
+            apply_key(&mut c, Key::Named(Named::Enter), None);
+            assert!(matches!(c.state(), State::Failed { .. }), "the fixture must fail first");
+
+            apply_key(&mut c, key.clone(), None);
+            assert!(
+                !matches!(c.state(), State::Failed { .. }),
+                "{key:?} left the error on screen with nothing a person could do"
+            );
+        }
     }
 
     /// Shifted characters must survive.
