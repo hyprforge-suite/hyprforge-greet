@@ -382,18 +382,36 @@ mod tests {
         (client, server)
     }
 
+    /// How long to wait for the worker thread before calling it wedged.
+    ///
+    /// Thirty seconds, against the twenty milliseconds this actually
+    /// takes — and the absurdity of that ratio is the point. The bound
+    /// is here so a worker that never answers fails the suite instead
+    /// of hanging it forever (CLAUDE.md's rule about never waiting on
+    /// another thread of control without one). It is *not* a claim
+    /// about how fast the handshake is, and nothing is measured against
+    /// it.
+    ///
+    /// It used to be one second, which looked generous — fifty times
+    /// the real figure, and it survived fifty-two local runs including
+    /// twelve with all sixteen cores saturated — and still went red on
+    /// a shared CI runner. A bound a loaded machine can cross is a test
+    /// that reports someone else's scheduling as a bug in this code.
+    const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Waits for the worker thread to answer.
     ///
     /// The backend is deliberately non-blocking, so a test has to pump
     /// like the real host does rather than assume the reply is instant.
     fn settle<B: Backend>(conversation: &mut Conversation<B>) {
-        for _ in 0..200 {
+        let giving_up_at = std::time::Instant::now() + ANSWER_WITHIN;
+        while std::time::Instant::now() < giving_up_at {
             if conversation.pump() {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        panic!("greetd never answered");
+        panic!("greetd never answered in {ANSWER_WITHIN:?}");
     }
 
     #[test]
