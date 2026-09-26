@@ -70,6 +70,11 @@ enum Message {
     /// Both the clock and the authenticator are driven from here: one
     /// needs the time, the other needs somebody to collect its answers.
     Tick,
+    /// Something the screen's pointer targets asked for. The greeter
+    /// offers none of them — no power button, no media — so these are
+    /// never produced; the variant exists because the screen is one
+    /// element for both hosts.
+    Screen,
 }
 
 struct Greeter {
@@ -91,12 +96,19 @@ struct Greeter {
     /// exactly once — greetd refuses a second `StartSession`, and the
     /// window is on its way out anyway.
     launched: bool,
+    /// When the last failure began, for the shake — shared with the lock
+    /// screen so the two cannot animate differently.
+    pacing: hyprforge_authui::scene::Pacing,
 }
 
 impl Greeter {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Key(key, text) => self.key(key, text),
+            Message::Key(key, text) => {
+                self.pacing.key(std::time::Instant::now());
+                self.key(key, text)
+            }
+            Message::Screen => {}
             // Collect anything greetd has said. Polling rather than
             // waking on the socket because the clock needs a tick
             // regardless, so there is already something arriving
@@ -118,6 +130,8 @@ impl Greeter {
             }
         }
 
+        self.pacing.observe(self.conversation.state(), std::time::Instant::now());
+
         if self.conversation.state().is_authenticated() && !self.launched {
             self.launched = true;
             // greetd runs this when the greeter exits, so scheduling it
@@ -138,13 +152,25 @@ impl Greeter {
         // not carry it. The lock screen shows it, and this should too —
         // it is the difference between a stuck key and an apparently
         // forgotten password. Noted rather than quietly dropped.
-        hyprforge_authui::screen::view(
-            self.conversation.state(),
-            self.conversation.username(),
+        //
+        // Always the card, never the idle clock: a login screen that
+        // makes someone press a key before it shows them who it is
+        // asking about is a lock screen's habit, not a greeter's.
+        let conversation = &self.conversation;
+        let mut scene = hyprforge_authui::scene::Scene::new(
+            conversation.state(),
+            conversation.username(),
             &self.theme,
             chrono::Local::now(),
-            false,
-        )
+        );
+        scene.submitted = conversation.submitted();
+        scene.rejection = self.pacing.rejection(
+            conversation.state(),
+            conversation.submitted(),
+            conversation.failures(),
+            std::time::Instant::now(),
+        );
+        hyprforge_authui::screen::view(scene).map(|_| Message::Screen)
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -158,7 +184,11 @@ impl Greeter {
             // Fast while the authenticator is working so the screen stays
             // visibly alive through PAM's deliberate pause; slow
             // otherwise, which is all the clock needs.
-            iced::time::every(if matches!(self.conversation.state(), State::Working) {
+            // And at frame rate while a rejected password shakes, which
+            // is under half a second.
+            iced::time::every(if self.pacing.animating(std::time::Instant::now()) {
+                std::time::Duration::from_millis(16)
+            } else if matches!(self.conversation.state(), State::Working) {
                 std::time::Duration::from_millis(100)
             } else {
                 std::time::Duration::from_secs(1)
@@ -255,6 +285,7 @@ fn main() -> iced::Result {
         theme,
         command,
         launched: false,
+        pacing: Default::default(),
     }));
 
     iced::application(
