@@ -236,6 +236,23 @@ fn apply_key<B: hyprforge_authui::conversation::Backend>(
 }
 
 fn main() -> iced::Result {
+    // Draw with tiny-skia, the renderer the lock screen uses, and never
+    // wgpu. Turning `web-colors` off made the two agree on *opaque*
+    // colours, but wgpu still blends in linear light while tiny-skia
+    // blends the sRGB values as written, so everything translucent came
+    // out different: the card's 55% background over a bright wallpaper
+    // came out close to clear here and nearly opaque on the lock screen,
+    // and the wallpaper dim did the same. The only way both can draw the
+    // same pixels is the same renderer. A login screen has no business
+    // needing a GPU driver in a good mood anyway — see authui's
+    // `screen` module.
+    //
+    // The environment variable is iced 0.14's only way to choose, and it
+    // is overridden unconditionally rather than defaulted: whatever greetd
+    // inherited must not bring the mismatch back. Set before anything
+    // here starts a thread.
+    std::env::set_var("ICED_BACKEND", "tiny-skia");
+
     // Defaulting to ERROR would silence every `warn!` here, and a greeter
     // is started by greetd with no RUST_LOG and no terminal — the journal
     // is the only place anyone can see what it did. See the same note in

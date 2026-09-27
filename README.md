@@ -8,6 +8,12 @@ supplies a window and talks to greetd. That's the whole reason the
 greeter and the lock screen look like one system — not because they
 were styled to match, but because there is one of them.
 
+It draws with the lock screen's renderer too: the greeter forces iced's
+software `tiny-skia` backend (`ICED_BACKEND`, set in `main`) and never
+uses wgpu, because wgpu blends translucent colours in linear light and
+the card's glass came out a visibly different strength on each screen.
+A login screen needs no GPU driver.
+
 Part of [Hyprforge](https://github.com/adamrpostjr/hyprforge), a suite of
 native Hyprland desktop apps — but it runs alone.
 
