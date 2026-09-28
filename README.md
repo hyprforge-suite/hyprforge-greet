@@ -14,7 +14,7 @@ uses wgpu, because wgpu blends translucent colours in linear light and
 the card's glass came out a visibly different strength on each screen.
 A login screen needs no GPU driver.
 
-Part of [Hyprforge](https://github.com/adamrpostjr/hyprforge), a suite of
+Part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge), a suite of
 native Hyprland desktop apps — but it runs alone.
 
 ## The property this repository must not lose

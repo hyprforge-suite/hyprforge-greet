@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A greetd greeter for Hyprland, sharing its look and authentication conversation with the lock screen."
-repository = "https://github.com/adamrpostjr/hyprforge"
+repository = "https://github.com/hyprforge-suite/hyprforge"
 documentation = "https://docs.rs/hyprforge-greet"
 readme = "README.md"
 keywords = ["hyprland", "wayland", "greetd", "greeter", "login"]
@@ -22,8 +22,8 @@ path = "src/main.rs"
 # workspace, the root Cargo.toml's `[patch]` section redirects these
 # straight back to the local `crates/` directories, so nothing here
 # touches the network; standalone, cargo fetches them from git.
-hyprforge-authui = { git = "https://github.com/adamrpostjr/hyprforge" }
-hyprforge-look = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-authui = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-look = { git = "https://github.com/hyprforge-suite/hyprforge" }
 # The same crate greetd itself uses, so the framing and the JSON tags
 # cannot drift from the daemon's. sync-codec rather than tokio: this
 # talks to greetd from a worker thread, exactly as the lock screen talks
