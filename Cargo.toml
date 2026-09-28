@@ -22,8 +22,8 @@ path = "src/main.rs"
 # workspace, the root Cargo.toml's `[patch]` section redirects these
 # straight back to the local `crates/` directories, so nothing here
 # touches the network; standalone, cargo fetches them from git.
-hyprforge-authui = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-look = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-authui = "0.1"
+hyprforge-look = "0.1"
 # The same crate greetd itself uses, so the framing and the JSON tags
 # cannot drift from the daemon's. sync-codec rather than tokio: this
 # talks to greetd from a worker thread, exactly as the lock screen talks

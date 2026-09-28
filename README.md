@@ -46,9 +46,8 @@ cargo build --release -p hyprforge-greet
 ```
 
 It depends on two other Hyprforge crates, `hyprforge-authui` and
-`hyprforge-look`, taken as git dependencies on the main repository
-rather than from crates.io, which is where they will move once they are
-published. Nothing else here is Hyprforge-specific.
+`hyprforge-look`, published on crates.io,
+so cargo fetches them from there and never needs the main repository. Nothing else here is Hyprforge-specific.
 
 ## It cannot read your home directory
 
