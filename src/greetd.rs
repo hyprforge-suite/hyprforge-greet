@@ -403,10 +403,20 @@ mod tests {
     ///
     /// The backend is deliberately non-blocking, so a test has to pump
     /// like the real host does rather than assume the reply is instant.
+    ///
+    /// It waits for the conversation to leave `Working` — the state that
+    /// means "an answer is owed" — and not for `pump` to report a change.
+    /// `new`, `submit` and `retry` each pump once themselves, so a worker
+    /// quick enough to answer before that pump has its reply applied
+    /// there, and every pump after it truthfully reports nothing new.
+    /// Waiting on the change hung for the whole thirty seconds whenever
+    /// that happened: about one suite run in fifteen, and 3 runs in 300
+    /// of this module pinned to a single CPU.
     fn settle<B: Backend>(conversation: &mut Conversation<B>) {
         let giving_up_at = std::time::Instant::now() + ANSWER_WITHIN;
         while std::time::Instant::now() < giving_up_at {
-            if conversation.pump() {
+            conversation.pump();
+            if !matches!(conversation.state(), State::Working) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
