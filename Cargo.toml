@@ -59,3 +59,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The live test lists the compositor's globals; nothing else here speaks
+# Wayland directly — iced does, through winit.
+wayland-client = "0.31"

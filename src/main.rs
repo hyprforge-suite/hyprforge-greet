@@ -12,6 +12,7 @@
 //! reaches into a user's files.
 
 mod greetd;
+mod ime;
 
 use clap::Parser;
 use greetd::GreetdBackend;
@@ -67,6 +68,9 @@ enum Message {
     /// password is silently wrong, and PAM rejects a password the user
     /// typed correctly.
     Key(Key, Option<String>),
+    /// What an input method said — see the `ime` module. Its pre-edit
+    /// has already been reduced to whether something is being composed.
+    Ime(ime::Said),
     /// Both the clock and the authenticator are driven from here: one
     /// needs the time, the other needs somebody to collect its answers.
     Tick,
@@ -99,14 +103,24 @@ struct Greeter {
     /// When the last failure began, for the shake — shared with the lock
     /// screen so the two cannot animate differently.
     pacing: hyprforge_authui::scene::Pacing,
+    /// Whether an input method is mid-composition, which holds keys back
+    /// so none is typed twice.
+    composition: ime::Composition,
 }
 
 impl Greeter {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Key(key, text) => {
-                self.pacing.key(std::time::Instant::now());
-                self.key(key, text)
+                if self.composition.lets_keys_through() {
+                    self.pacing.key(std::time::Instant::now());
+                    self.key(key, text)
+                }
+            }
+            Message::Ime(said) => {
+                if apply_ime(&mut self.conversation, &mut self.composition, said) {
+                    self.pacing.key(std::time::Instant::now());
+                }
             }
             Message::Screen => {}
             // Collect anything greetd has said. Polling rather than
@@ -170,7 +184,11 @@ impl Greeter {
             conversation.failures(),
             std::time::Instant::now(),
         );
-        hyprforge_authui::screen::view(scene).map(|_| Message::Screen)
+        let wanted = match conversation.state() {
+            State::Asking { prompt, .. } => ime::Wanted::On { secret: prompt.secret },
+            _ => ime::Wanted::Off,
+        };
+        ime::ime(hyprforge_authui::screen::view(scene).map(|_| Message::Screen), wanted, Message::Ime).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -233,6 +251,27 @@ fn apply_key<B: hyprforge_authui::conversation::Backend>(
         },
     };
     conversation::apply_press(conversation, press);
+}
+
+/// What an input method said, applied to the conversation. True when
+/// it typed something.
+///
+/// A commit goes through the same door as a key's text, so it obeys the
+/// same grammar: it leaves a failed attempt, it is buffered while the
+/// backend works, and control characters are dropped.
+fn apply_ime<B: hyprforge_authui::conversation::Backend>(
+    conversation: &mut Conversation<B>,
+    composition: &mut ime::Composition,
+    said: ime::Said,
+) -> bool {
+    composition.hear(&said);
+    match said {
+        ime::Said::Commit(ime::Committed(text)) => {
+            conversation::apply_press(conversation, Press::Text(text));
+            true
+        }
+        ime::Said::Composing(_) => false,
+    }
 }
 
 fn main() -> iced::Result {
@@ -303,6 +342,7 @@ fn main() -> iced::Result {
         command,
         launched: false,
         pacing: Default::default(),
+        composition: Default::default(),
     }));
 
     iced::application(
@@ -436,5 +476,51 @@ mod tests {
         apply_key(&mut c, Key::Character("x".into()), Some("x".into()));
         apply_key(&mut c, Key::Named(Named::Escape), Some("\u{1b}".into()));
         assert_eq!(c.entered(), "");
+    }
+
+    /// One key press as the window delivers it, held back while an input
+    /// method is composing — `update`'s rule, without a greetd socket.
+    fn press<B: Backend>(c: &mut Conversation<B>, composition: &ime::Composition, key: Key, text: Option<&str>) {
+        if composition.lets_keys_through() {
+            apply_key(c, key, text.map(str::to_string));
+        }
+    }
+
+    /// The keys that build a composition belong to the input method. If
+    /// it lets them through as well as committing their result, each
+    /// must still count once — and the Enter that picks a candidate must
+    /// not submit the password.
+    #[test]
+    fn a_composed_character_is_typed_once_and_its_enter_submits_nothing() {
+        let mut c = typing();
+        c.pump();
+        let mut composition = ime::Composition::default();
+
+        press(&mut c, &composition, Key::Character("a".into()), Some("a"));
+        apply_ime(&mut c, &mut composition, ime::Said::Composing(true));
+        press(&mut c, &composition, Key::Character("n".into()), Some("n"));
+        press(&mut c, &composition, Key::Named(Named::Enter), Some("\r"));
+        assert!(c.state().accepts_input(), "the candidate's Enter must not submit");
+        apply_ime(&mut c, &mut composition, ime::Said::Composing(false));
+        apply_ime(&mut c, &mut composition, ime::Said::Commit(ime::Committed("日".into())));
+        press(&mut c, &composition, Key::Character("b".into()), Some("b"));
+
+        assert_eq!(c.typed(), "a日b");
+    }
+
+    /// A commit after "Incorrect password" starts a new attempt and is
+    /// kept, exactly as a typed key is.
+    #[test]
+    fn a_commit_after_a_failure_starts_over_and_is_kept() {
+        let mut c = Conversation::new(Rejecting(None), "apost");
+        c.pump();
+        apply_key(&mut c, Key::Named(Named::Enter), None);
+        c.pump();
+        assert!(matches!(c.state(), State::Failed { .. }), "the fixture must fail first");
+
+        let mut composition = ime::Composition::default();
+        assert!(apply_ime(&mut c, &mut composition, ime::Said::Commit(ime::Committed("日".into()))));
+        c.pump();
+        assert_eq!(c.typed(), "日");
     }
 }

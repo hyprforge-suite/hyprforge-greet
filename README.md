@@ -62,6 +62,22 @@ right group permissions, and the full install sequence — read it in
 full before installing this as your login manager; it is written so
 every step up to the last is reversible from a spare virtual terminal.
 
+## Input methods: the client half only
+
+While a question is open, the greeter asks for an input method through
+`text-input-v3` (`src/ime.rs`), as a password field when the question is
+secret. What an input method commits reaches the entry through the same
+grammar as a typed key; its pre-edit is never drawn or kept, and no key
+counts while a composition is under way, so nothing is entered twice.
+
+Nothing here starts an input method. `config/hyprland-greeter.lua` runs no
+program but the greeter, and an input method running before anyone has
+logged in carries its own shortcuts and settings windows: the same reason
+that file has no key binds. Until that is settled, the request reaches a
+compositor with no input method to answer it, and typing works exactly as
+it did. `tests/live_text_input.rs` checks the compositor offers the
+protocol.
+
 ## Testing it safely — read this before running the binary
 
 Do **not** try this against a real greetd installation while iterating.
