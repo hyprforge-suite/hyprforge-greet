@@ -16,7 +16,14 @@
 -- is the habit, and the next person to add one will add it next to the
 -- others.
 --
--- No `exec_cmd` either, beyond the greeter itself.
+-- No `exec_cmd` either, beyond the greeter itself. The greeter starts
+-- one program of its own: fcitx5, when it is installed, with every addon
+-- off except an allow-list that has no menu, settings tool or key that
+-- starts another program — see `src/input_method.rs` for the list and
+-- why each is safe. It is started from the greeter, after the wait
+-- below, rather than with an `exec_cmd` here, so it gets the same
+-- display the greeter found and the choice stays in code a test can
+-- read. Nothing else runs.
 
 -- Displays, in the layout the session uses.
 --

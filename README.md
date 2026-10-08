@@ -62,21 +62,44 @@ right group permissions, and the full install sequence — read it in
 full before installing this as your login manager; it is written so
 every step up to the last is reversible from a spare virtual terminal.
 
-## Input methods: the client half only
+## Input methods
 
 While a question is open, the greeter asks for an input method through
 `text-input-v3` (`src/ime.rs`), as a password field when the question is
 secret. What an input method commits reaches the entry through the same
 grammar as a typed key; its pre-edit is never drawn or kept, and no key
 counts while a composition is under way, so nothing is entered twice.
+`tests/live_text_input.rs` checks the compositor offers the protocol.
 
-Nothing here starts an input method. `config/hyprland-greeter.lua` runs no
-program but the greeter, and an input method running before anyone has
-logged in carries its own shortcuts and settings windows: the same reason
-that file has no key binds. Until that is settled, the request reaches a
-compositor with no input method to answer it, and typing works exactly as
-it did. `tests/live_text_input.rs` checks the compositor offers the
-protocol.
+**What answers it is fcitx5, with most of it switched off.** When fcitx5
+is installed, the greeter starts it in its own compositor
+(`src/input_method.rs`; `--no-input-method` to opt out). An input method
+before login is the no-key-binds rule arriving through another door —
+whoever is at the keyboard is unauthenticated, and fcitx5 carries a
+settings tool, a restart and, in some engines, keys that start other
+programs. So it runs with `--disable=all` and only an allow-list of
+addons whose source was read for this: the Wayland frontend, the
+candidate window, plain keyboard layouts, and the pinyin, table, rime and
+hangul engines. Every menu that starts a program lives in an addon that
+list leaves out; anthy is left out because it binds F11 and F12 to a
+dictionary editor. The module's doc lists each one, with where in
+fcitx5's source it was found.
+
+- **Not for passwords.** fcitx5 passes a password field straight
+  through as plain keys, and that is pinned on here: composing a
+  password would show it in the candidate window, in clear.
+- **Nothing learned is kept.** Its configuration and data are made fresh
+  under `$XDG_RUNTIME_DIR` at each start.
+- **Which input methods it offers** comes from
+  `/var/lib/hyprforge/greet/fcitx5-profile` when there is one — a copy of
+  your `~/.config/fcitx5/profile`, beside the exported theme — and from
+  your locale otherwise. Only that file is read.
+- **IBus is never started here.** Its Wayland input method is its GTK
+  panel, which is also the menu that opens its settings; one cannot run
+  without the other.
+
+Not installed is the usual case, and then the login screen is exactly
+what it was.
 
 ## Testing it safely — read this before running the binary
 

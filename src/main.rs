@@ -13,6 +13,7 @@
 
 mod greetd;
 mod ime;
+mod input_method;
 
 use clap::Parser;
 use greetd::GreetdBackend;
@@ -44,6 +45,13 @@ struct Args {
     /// Settings app writes to.
     #[arg(long)]
     theme_dir: Option<std::path::PathBuf>,
+
+    /// Don't start an input method in this compositor.
+    ///
+    /// By default fcitx5 is started, with most of it switched off, when
+    /// it is installed — see `input_method.rs` for what runs and why.
+    #[arg(long)]
+    no_input_method: bool,
 
     /// Type this in once a question is being asked, then submit.
     ///
@@ -323,6 +331,12 @@ fn main() -> iced::Result {
     // its doc for why. `--theme-dir` is why this calls that with a
     // variable directory instead of the fixed-path `load_exported()`.
     let theme = hyprforge_authui::screen::renderable(Theme::load_exported_from(&dir));
+
+    // Started before the window, so it is usually there by the time the
+    // first question asks for it; held for the life of the greeter and
+    // never waited on — it ends with the compositor, when its display
+    // goes. Absent or failing, the login screen is the one it was.
+    let _input_method = if args.no_input_method { None } else { input_method::start(&dir) };
 
     let command: Vec<String> = args.command.split_whitespace().map(str::to_string).collect();
     let font = hyprforge_authui::screen::font(&theme);
