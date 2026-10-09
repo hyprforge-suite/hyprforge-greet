@@ -17,6 +17,8 @@ A login screen needs no GPU driver.
 Part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge), a suite of
 native Hyprland desktop apps — but it runs alone.
 
+![The greeter: the lock screen's card and clock, asking a user to log in](https://raw.githubusercontent.com/hyprforge-suite/hyprforge/main/docs/images/greeter.png)
+
 ## The property this repository must not lose
 
 **The compositor that runs this greeter has no keybinds. Not one.**
