@@ -78,6 +78,15 @@ sudo install -Dm644 crates/hyprforge-greet/config/hyprland-greeter.lua \
 Then edit `/etc/greetd/hyprland-greeter.lua` and replace `CHANGE_ME`
 with your username. It is a template, not a drop-in.
 
+From the Arch package (`hyprforge-greet`), the binary, the sysusers and
+tmpfiles entries of step 1 are already installed, and the two templates
+are in `/usr/share/hyprforge-greet/`:
+
+```sh
+sudo install -Dm644 /usr/share/hyprforge-greet/hyprland-greeter.lua \
+    /etc/greetd/hyprland-greeter.lua
+```
+
 Read the rest of that file before installing it. **It has no keybinds,
 and that is the security property, not an oversight.** Every bind the
 greeter's compositor has belongs to whoever is standing at the keyboard,

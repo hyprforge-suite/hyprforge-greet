@@ -110,6 +110,13 @@ hl.config({
 -- greeter user gets a fresh runtime directory with exactly one
 -- compositor in it.
 --
+-- The exit is `hyprctl dispatch "hl.dsp.exit()"`: under a Lua config
+-- `dispatch` takes Lua, and the hyprlang `hyprctl dispatch exit` this
+-- once said was answered on every login with "hl.dispatch: expected a
+-- dispatcher" in /tmp/hyprforge-greet.log — the compositor was never
+-- asked to leave. Double quotes, because this whole script sits inside
+-- `sh -c '…'`.
+--
 -- `--user` must name the account to log in. There is no user picker
 -- yet, so this is where the choice is made.
 --
@@ -145,5 +152,5 @@ hl.exec_cmd([[sh -c '
     echo "--- greeter output ---"
     hyprforge-greet --user CHANGE_ME --command "uwsm start hyprland.desktop"
     echo "greeter exited $?"
-    hyprctl dispatch exit
+    hyprctl dispatch "hl.dsp.exit()"
 ']])
