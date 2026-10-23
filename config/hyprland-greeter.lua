@@ -35,16 +35,33 @@
 --
 -- So the real layout is exported alongside the theme, for the same
 -- reason the theme is: the greeter runs as another user and cannot
--- traverse into a home directory to read the original. This is a plain
--- `dofile` rather than a `require` because the export is not on the
+-- traverse into a home directory to read the original. This is a
+-- `loadfile` rather than a `require` because the export is not on the
 -- greeter's Lua path and should not be added to it.
+--
+-- **The export is not trusted, and is not run with this file's powers.**
+-- Its directory is writable by the whole `hyprforge` group, and this
+-- runs inside the login screen's compositor before anyone has
+-- authenticated. Run with the global environment, one `hl.exec_cmd` or
+-- `hl.bind` in it would belong to whoever stands at the keyboard — the
+-- exact hole the "no binds" rule above exists to close, reopened
+-- through a file. So it gets an environment of its own holding
+-- `hl.monitor` and nothing else, which is the only call displayd's
+-- generator (`monitors_codegen::generate`) ever writes; and it is
+-- loaded in text mode ("t"), because Lua does not verify precompiled
+-- bytecode and a crafted chunk can escape any environment.
+--
+-- What the sandbox does not bound is time: a file that loops forever
+-- still stalls this config. The sticky, setgid directory (see
+-- hyprforge-greet.tmpfiles) is what keeps that file to its writer.
 --
 -- The fallback is not styling, it is a guarantee: a greeter must come
 -- up on a display that has never been configured, on a machine where
 -- nothing has been exported yet, and on the first boot after a new
 -- monitor is plugged in.
 local exported = "/var/lib/hyprforge/greet/monitors.lua"
-local loaded = loadfile(exported)
+local sandbox = { hl = { monitor = hl.monitor } }
+local loaded = loadfile(exported, "t", sandbox)
 if loaded then
     local ok, err = pcall(loaded)
     if not ok then
@@ -81,6 +98,13 @@ hl.config({
         -- A login screen that animates in is a login screen that is
         -- slower to appear.
         enabled = false,
+    },
+    ecosystem = {
+        -- Hyprland's own update-news and donation windows, which it
+        -- opens unasked and whose links run `xdg-open`: a browser on
+        -- the login screen, for someone who has not logged in.
+        no_update_news = true,
+        no_donation_nag = true,
     },
 })
 

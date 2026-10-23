@@ -7,12 +7,16 @@
 # a directory permission, not a file permission, so no amount of
 # chmod-ing the theme itself would help.
 #
-# 2775: setgid, so everything written here keeps the hyprforge group
+# 3775: setgid, so everything written here keeps the hyprforge group
 # and a second user's export stays readable by the greeter instead of
 # landing group-root. Group-writable because the Settings app runs as
 # you, unprivileged; world-readable because the greeter has to read it.
+# Sticky, because group-writable alone lets any member of the group
+# delete or rename-over a file another member wrote — and monitors.lua
+# here is read by the login screen's compositor. Each writer replaces
+# its own files atomically, which the sticky bit still allows.
 #
 # The files inside are written 0644 by the exporting process's umask,
 # which is what the greeter needs and no more.
 d /var/lib/hyprforge      0755 root root      -
-d /var/lib/hyprforge/greet 2775 root hyprforge -
+d /var/lib/hyprforge/greet 3775 root hyprforge -

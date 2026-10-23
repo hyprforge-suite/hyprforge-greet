@@ -522,6 +522,72 @@ mod tests {
         assert_eq!(c.typed(), "a日b");
     }
 
+    /// The compositor config, as shipped.
+    const GREETER_LUA: &str = include_str!("../config/hyprland-greeter.lua");
+
+    /// The exported monitor layout is a file other accounts can write,
+    /// and it is run inside the compositor of the login screen — before
+    /// anyone has authenticated. Loaded with the full global environment,
+    /// anything in the `hyprforge` group could put an `hl.bind` or an
+    /// `hl.exec_cmd` in front of every login. So it is loaded as text
+    /// (never precompiled bytecode, which Lua does not verify) into an
+    /// environment that holds `hl.monitor` and nothing else.
+    ///
+    /// A pin on the text rather than an evaluation, because nothing in
+    /// this crate evaluates Lua; what the sandbox actually permits is
+    /// worth checking in a nested greeter after any change here.
+    #[test]
+    fn the_exported_layout_is_loaded_as_text_into_a_monitor_only_environment() {
+        let code: Vec<&str> = GREETER_LUA
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("--"))
+            .collect();
+        let loads: Vec<&&str> = code.iter().filter(|line| line.contains("loadfile(")).collect();
+        assert_eq!(loads.len(), 1, "exactly one loadfile, of the export: {loads:?}");
+        assert!(
+            loads[0].contains(r#"loadfile(exported, "t", sandbox)"#),
+            "the export must be loaded as text into its own environment: {}",
+            loads[0]
+        );
+        let sandbox: String = code
+            .iter()
+            .skip_while(|line| !line.starts_with("local sandbox"))
+            .take_while(|line| !line.contains("loadfile("))
+            .copied()
+            .collect();
+        assert!(sandbox.contains("monitor = hl.monitor"), "{sandbox}");
+        for forbidden in ["exec_cmd", "bind", "dispatch", "_G", "require", "dofile", "load"] {
+            assert!(!sandbox.contains(forbidden), "the sandbox hands over {forbidden}: {sandbox}");
+        }
+    }
+
+    /// The export directory is group-writable so the Settings app can
+    /// write into it as the user, and without the sticky bit one member
+    /// of the group can replace a file another member wrote — the
+    /// greeter's monitor layout among them.
+    #[test]
+    fn the_export_directory_is_sticky() {
+        let tmpfiles = include_str!("../config/hyprforge-greet.tmpfiles");
+        let line = tmpfiles
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some("/var/lib/hyprforge/greet"))
+            .expect("the export directory is declared");
+        let mode = line.split_whitespace().nth(2).expect("a mode");
+        let mode = u32::from_str_radix(mode, 8).expect("an octal mode");
+        assert_ne!(mode & 0o1000, 0, "not sticky: {line}");
+        assert_ne!(mode & 0o2000, 0, "setgid is still wanted: {line}");
+    }
+
+    /// Hyprland opens its update-news and donation windows on its own,
+    /// and they open links with `xdg-open` — a browser at the login
+    /// screen, for whoever is standing there.
+    #[test]
+    fn the_greeter_compositor_opens_no_windows_of_its_own() {
+        assert!(GREETER_LUA.contains("no_update_news = true"), "update news is not switched off");
+        assert!(GREETER_LUA.contains("no_donation_nag = true"), "the donation window is not switched off");
+    }
+
     /// A commit after "Incorrect password" starts a new attempt and is
     /// kept, exactly as a typed key is.
     #[test]
