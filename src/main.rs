@@ -16,7 +16,7 @@ mod ime;
 mod input_method;
 
 use clap::Parser;
-use greetd::GreetdBackend;
+use greetd::{GreetdBackend, Launch};
 use hyprforge_authui::conversation::{self, Conversation, Press, State};
 use hyprforge_authui::Theme;
 use iced::keyboard::{key::Named, Key};
@@ -104,10 +104,14 @@ struct Greeter {
     type_in: Option<String>,
     theme: Theme,
     command: Vec<String>,
-    /// Set once the session has been scheduled, so it is asked for
-    /// exactly once — greetd refuses a second `StartSession`, and the
-    /// window is on its way out anyway.
+    /// Set once the session has been asked for, so it is asked for
+    /// exactly once per login — greetd refuses a second `StartSession`.
+    /// Cleared again only if greetd refused it, which sends the person
+    /// back to log in afresh.
     launched: bool,
+    /// Set when the connection to greetd is lost, so `main` can exit
+    /// unsuccessfully once the window has closed.
+    lost: std::rc::Rc<std::cell::Cell<bool>>,
     /// When the last failure began, for the shake — shared with the lock
     /// screen so the two cannot animate differently.
     pacing: hyprforge_authui::scene::Pacing,
@@ -156,9 +160,32 @@ impl Greeter {
 
         if self.conversation.state().is_authenticated() && !self.launched {
             self.launched = true;
-            // greetd runs this when the greeter exits, so scheduling it
-            // and closing the window are one action.
+            // greetd runs this when the greeter exits — but only once it
+            // has taken the request, which `launched` below waits for.
             self.conversation.backend().launch(self.command.clone(), Vec::new());
+        }
+        if self.launched {
+            match self.conversation.backend().launched() {
+                Launch::Waiting => {}
+                Launch::Started => return iced::exit(),
+                Launch::Refused(reason) => {
+                    // Shown where every other failure is, and the next
+                    // Enter starts the login over — which cancels the
+                    // session greetd would not start.
+                    tracing::warn!("greetd refused to start the session: {reason}");
+                    self.launched = false;
+                    self.conversation.backend().report(reason);
+                    self.conversation.pump();
+                }
+            }
+        }
+
+        // A connection that is gone does not come back, and every retry
+        // on it fails the same way. Exiting is what gets a new one:
+        // greetd restarts a greeter that exits without starting a
+        // session, and `main` makes the exit an unsuccessful one.
+        if self.conversation.backend().connection_lost() {
+            self.lost.set(true);
             return iced::exit();
         }
         Task::none()
@@ -214,7 +241,7 @@ impl Greeter {
             // is under half a second.
             iced::time::every(if self.pacing.animating(std::time::Instant::now()) {
                 std::time::Duration::from_millis(16)
-            } else if matches!(self.conversation.state(), State::Working) {
+            } else if self.launched || matches!(self.conversation.state(), State::Working) {
                 std::time::Duration::from_millis(100)
             } else {
                 std::time::Duration::from_secs(1)
@@ -347,6 +374,7 @@ fn main() -> iced::Result {
     // being true, this will say so loudly rather than silently open a
     // second login screen with no way to authenticate.
     let drew = std::rc::Rc::new(std::cell::Cell::new(false));
+    let lost = std::rc::Rc::new(std::cell::Cell::new(false));
     let once = std::cell::RefCell::new(Some(Greeter {
         conversation: Conversation::new(backend, args.user.clone()),
         drew: std::rc::Rc::clone(&drew),
@@ -355,6 +383,7 @@ fn main() -> iced::Result {
         theme,
         command,
         launched: false,
+        lost: std::rc::Rc::clone(&lost),
         pacing: Default::default(),
         composition: Default::default(),
     }));
@@ -379,6 +408,11 @@ fn main() -> iced::Result {
         ..iced::window::Settings::default()
     })
     .run()?;
+
+    if lost.get() {
+        eprintln!("lost the connection to greetd; exiting so it starts a fresh greeter");
+        std::process::exit(1);
+    }
 
     // Ending without ever having drawn is a failure, whatever the event
     // loop thought. Reporting it as success is what made a lost startup

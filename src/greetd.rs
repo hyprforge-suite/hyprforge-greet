@@ -41,7 +41,10 @@ use greetd_ipc::codec::SyncCodec;
 use greetd_ipc::{AuthMessageType, ErrorType, Request, Response as Greetd};
 use hyprforge_authui::conversation::{Backend, Prompt, Response};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// How long to wait for greetd to answer one request.
 ///
@@ -55,6 +58,14 @@ use std::sync::mpsc::{Receiver, Sender};
 /// password, and a directory-backed stack can take far longer. Cutting
 /// off a slow-but-working login would be worse than the hang.
 const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long the greeter waits to hear that greetd took `StartSession`.
+///
+/// Far shorter than [`REPLY_TIMEOUT`], because no PAM sits behind this
+/// one: greetd only records the command it will run once the greeter
+/// exits, and answers at once. A greetd that cannot do that in ten
+/// seconds is not going to.
+pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where greetd told us to talk to it.
 ///
@@ -84,10 +95,53 @@ pub enum GreetdError {
 /// there for what believing greetd's documentation on this cost.
 enum Ask {
     Start(String),
-    Answer(Option<String>),
+    Answer(Option<Wiped>),
     /// Not part of the conversation: the session to launch once this
-    /// process exits.
-    Launch { command: Vec<String>, environment: Vec<String> },
+    /// process exits. Answered on its own channel, so the reply can
+    /// never be read as a step of the conversation.
+    Launch { command: Vec<String>, environment: Vec<String>, reply: Sender<Result<(), String>> },
+}
+
+/// An answer on its way to greetd, erased when it is dropped.
+///
+/// The conversation hands this backend a `&str` that its own `Secret`
+/// erases; the copy that crosses to the greetd thread is this crate's,
+/// and a bare `String` would be freed with the password still in it.
+/// What `greetd_ipc` does with it while serialising is out of reach.
+struct Wiped(String);
+
+impl Wiped {
+    fn new(text: &str) -> Wiped {
+        Wiped(text.to_string())
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        wipe(std::mem::take(&mut self.0).into_bytes());
+    }
+}
+
+/// Zeroes a buffer in a way the optimiser may not remove — a plain
+/// `fill(0)` on memory about to be freed is a dead store, and it is
+/// allowed to vanish.
+fn wipe(mut bytes: Vec<u8>) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: a valid, aligned, exclusively borrowed `u8`.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+}
+
+/// Where a requested launch stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launch {
+    /// Asked; greetd has not answered yet.
+    Waiting,
+    /// greetd will start the session when this process exits.
+    Started,
+    /// greetd said no. The login has to be done again.
+    Refused(String),
 }
 
 /// greetd, answered on its own thread.
@@ -101,6 +155,16 @@ pub struct GreetdBackend {
     /// `Conversation::pump` into a spin, because pump loops while poll
     /// keeps yielding.
     reported_loss: bool,
+    /// Set by the greetd thread when it gives up on the socket.
+    ///
+    /// Not something the conversation can express: it reports a failure
+    /// and offers a retry, and every retry after this one fails the same
+    /// way, because the thread that would carry it has gone. The host
+    /// reads this and exits, so greetd starts a fresh greeter on a fresh
+    /// connection — the only way back, and greetd's job.
+    gone: Arc<AtomicBool>,
+    /// The launch in flight: its reply, and when to stop waiting for it.
+    launching: Option<(Receiver<Result<(), String>>, Instant)>,
 }
 
 impl GreetdBackend {
@@ -131,20 +195,79 @@ impl GreetdBackend {
         let _ = stream.set_write_timeout(Some(timeout));
         let (to_greetd, asks) = std::sync::mpsc::channel();
         let (answers, from_greetd) = std::sync::mpsc::channel();
+        let gone = Arc::new(AtomicBool::new(false));
+        let thread_gone = Arc::clone(&gone);
         std::thread::Builder::new()
             .name("greetd".into())
-            .spawn(move || run(stream, asks, answers))
+            .spawn(move || run(stream, asks, answers, thread_gone))
             .expect("failed to start the greetd thread");
-        GreetdBackend { to_greetd, from_greetd, lost: None, reported_loss: false }
+        GreetdBackend { to_greetd, from_greetd, lost: None, reported_loss: false, gone, launching: None }
     }
 
     /// Asks greetd to run `command` once this process exits.
     ///
     /// Only valid after the conversation reported success. greetd starts
-    /// the session when the greeter goes away, so the caller's next move
-    /// is to exit — see the note on `Outcome` in `main`.
+    /// the session when the greeter goes away — but only once it has
+    /// *taken* the request, so the caller waits for [`launched`] to say
+    /// `Started` before exiting. Exiting straight after posting it raced
+    /// the greetd thread: a greeter gone before the request reached the
+    /// socket left greetd with an authenticated session and nothing to
+    /// run, and a refusal was never seen by anyone.
+    ///
+    /// [`launched`]: Self::launched
     pub fn launch(&mut self, command: Vec<String>, environment: Vec<String>) {
-        self.post(Ask::Launch { command, environment });
+        self.launch_within(command, environment, LAUNCH_TIMEOUT);
+    }
+
+    /// [`launch`](Self::launch) with the bound spelled out, for tests.
+    pub fn launch_within(&mut self, command: Vec<String>, environment: Vec<String>, bound: Duration) {
+        let (reply, outcome) = std::sync::mpsc::channel();
+        self.launching = Some((outcome, Instant::now() + bound));
+        self.post(Ask::Launch { command, environment, reply });
+    }
+
+    /// Where the last [`launch`](Self::launch) stands. Never blocks.
+    ///
+    /// No answer within the bound is not a refusal to show and retry:
+    /// the greetd thread is still inside that exchange, and a socket with
+    /// a reply outstanding is one this greeter can no longer trust (see
+    /// [`run`]). It counts as the connection lost, so the host exits and
+    /// greetd starts over.
+    pub fn launched(&mut self) -> Launch {
+        let Some((outcome, deadline)) = &self.launching else {
+            return Launch::Waiting;
+        };
+        let result = match outcome.try_recv() {
+            Ok(Ok(())) => Launch::Started,
+            Ok(Err(reason)) => Launch::Refused(reason),
+            Err(std::sync::mpsc::TryRecvError::Empty) if Instant::now() < *deadline => return Launch::Waiting,
+            // Out of time, or the thread dropped the reply on its way
+            // out: either way nobody is going to answer.
+            Err(_) => {
+                self.gone.store(true, Ordering::SeqCst);
+                return Launch::Waiting;
+            }
+        };
+        self.launching = None;
+        result
+    }
+
+    /// Puts a failure in front of the conversation, through the same
+    /// door as everything greetd says — for a refusal that arrived
+    /// outside the conversation, like a launch greetd would not take.
+    pub fn report(&mut self, reason: String) {
+        self.lost = Some(Response::Failure { reason });
+    }
+
+    /// Whether the connection to greetd is beyond use.
+    ///
+    /// Once true it stays true: a retry posts to a thread that has
+    /// returned. The host's move is to exit unsuccessfully so greetd
+    /// restarts the greeter; a login screen that only says "the login
+    /// service stopped responding" and takes no further input is a
+    /// machine nobody can get into until someone changes VT.
+    pub fn connection_lost(&self) -> bool {
+        self.reported_loss || self.gone.load(Ordering::SeqCst)
     }
 
     fn post(&mut self, ask: Ask) {
@@ -164,7 +287,7 @@ impl Backend for GreetdBackend {
     }
 
     fn answer(&mut self, answer: &str) {
-        self.post(Ask::Answer(Some(answer.to_string())));
+        self.post(Ask::Answer(Some(Wiped::new(answer))));
     }
 
     /// Acknowledges a message greetd did not want an answer to.
@@ -198,13 +321,20 @@ impl Backend for GreetdBackend {
 /// Every write is paired with exactly one read and nothing else touches
 /// the stream in between, which is the property the whole module depends
 /// on — see [`run`] for what a missed reply would cost.
-fn exchange(stream: &mut UnixStream, request: Request) -> Result<Greetd, ()> {
+fn exchange(stream: &mut UnixStream, request: &Request) -> Result<Greetd, ()> {
     request.write_to(stream).map_err(|_| ())?;
     Greetd::read_from(stream).map_err(|_| ())
 }
 
 /// The greetd thread. Kept small: everything here can start a session.
-fn run(mut stream: UnixStream, asks: Receiver<Ask>, answers: Sender<Response>) {
+fn run(mut stream: UnixStream, asks: Receiver<Ask>, answers: Sender<Response>, gone: Arc<AtomicBool>) {
+    // Set before the failure is sent, so a host that reads the failure
+    // and then asks `connection_lost` cannot see the one without the
+    // other.
+    let give_up = || {
+        gone.store(true, Ordering::SeqCst);
+        let _ = answers.send(unreachable_service());
+    };
     while let Ok(ask) = asks.recv() {
         let request = match ask {
             Ask::Start(username) => {
@@ -235,19 +365,43 @@ fn run(mut stream: UnixStream, asks: Receiver<Ask>, answers: Sender<Response>) {
                 // reporting a cancel error would put a confusing
                 // sentence in front of someone whose password was
                 // about to work.
-                if exchange(&mut stream, Request::CancelSession).is_err() {
-                    let _ = answers.send(unreachable_service());
+                if exchange(&mut stream, &Request::CancelSession).is_err() {
+                    give_up();
                     return;
                 }
                 Request::CreateSession { username }
             }
-            Ask::Answer(response) => Request::PostAuthMessageResponse { response },
-            Ask::Launch { command, environment } => {
-                Request::StartSession { cmd: command, env: environment }
+            Ask::Answer(response) => {
+                // greetd_ipc wants an owned `String`. It gets a copy, the
+                // `Wiped` original is erased at the end of this arm, and
+                // the copy is erased once it has been written, below.
+                Request::PostAuthMessageResponse { response: response.as_ref().map(|answer| answer.0.clone()) }
+            }
+            Ask::Launch { command, environment, reply } => {
+                let request = Request::StartSession { cmd: command, env: environment };
+                let Ok(answer) = exchange(&mut stream, &request) else {
+                    gone.store(true, Ordering::SeqCst);
+                    let _ = reply.send(Err("the login service stopped responding".into()));
+                    return;
+                };
+                let _ = reply.send(match answer {
+                    Greetd::Success => Ok(()),
+                    Greetd::Error { description, .. } => Err(format!("Couldn't start the session: {description}")),
+                    // A question after the login already succeeded is not
+                    // part of any exchange greetd documents.
+                    Greetd::AuthMessage { .. } => {
+                        Err("Couldn't start the session: the login service asked something unexpected".into())
+                    }
+                });
+                continue;
             }
         };
 
-        let Ok(reply) = exchange(&mut stream, request) else {
+        let exchanged = exchange(&mut stream, &request);
+        if let Request::PostAuthMessageResponse { response: Some(text) } = request {
+            wipe(text.into_bytes());
+        }
+        let Ok(reply) = exchanged else {
             // Returning rather than trying again, and this is the
             // security-relevant part. A timed-out read leaves the
             // connection desynchronised: greetd's late answer to *this*
@@ -255,8 +409,11 @@ fn run(mut stream: UnixStream, asks: Receiver<Ask>, answers: Sender<Response>) {
             // a stale `Success` could be matched to a later attempt.
             // Once a reply is missed the socket is unusable, and the way
             // back is a fresh greeter — which is greetd's job when this
-            // process exits.
-            let _ = answers.send(unreachable_service());
+            // process exits, and why `give_up` marks the connection
+            // gone: `main` reads that and exits. It once did not, and a
+            // single missed reply left a login screen that failed every
+            // retry until someone changed VT.
+            give_up();
             return;
         };
         if answers.send(translate(reply)).is_err() {
@@ -647,6 +804,140 @@ mod tests {
             conversation.state()
         );
         drop(server);
+    }
+
+    /// After a missed reply the socket is abandoned, and every retry
+    /// fails the same way — so the host has to be told, to exit and let
+    /// greetd start a greeter with a connection that works. It was not:
+    /// the screen said "stopped responding" and nothing ever got past
+    /// it until someone changed VT.
+    #[test]
+    fn a_missed_reply_marks_the_connection_lost_for_good() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let client = UnixStream::connect(&path).expect("connect");
+        let server = listener.accept().expect("accept").0;
+
+        let mut conversation = Conversation::new(
+            GreetdBackend::over_with_timeout(client, std::time::Duration::from_millis(200)),
+            "apost",
+        );
+        settle(&mut conversation);
+        assert!(matches!(conversation.state(), State::Failed { .. }));
+        assert!(conversation.backend().connection_lost(), "the host was never told to give up");
+
+        conversation.retry();
+        settle(&mut conversation);
+        assert!(conversation.backend().connection_lost(), "a retry cannot bring it back");
+        drop(server);
+    }
+
+    /// A healthy connection is not reported lost — exiting on a false
+    /// alarm would throw someone off the login screen mid-password.
+    #[test]
+    fn a_working_connection_is_not_reported_lost() {
+        let (stream, _server) = fake_greetd(vec![Greetd::AuthMessage {
+            auth_message_type: AuthMessageType::Secret,
+            auth_message: "Password:".into(),
+        }]);
+        let mut conversation = Conversation::new(GreetdBackend::over(stream), "apost");
+        settle(&mut conversation);
+        assert!(!conversation.backend().connection_lost());
+    }
+
+    /// Logs in through the fake greetd and asks for the session.
+    fn log_in_and_launch(start_session: Greetd) -> (Conversation<GreetdBackend>, std::thread::JoinHandle<Vec<Request>>) {
+        let (stream, server) = fake_greetd(vec![
+            Greetd::AuthMessage { auth_message_type: AuthMessageType::Secret, auth_message: "Password:".into() },
+            Greetd::Success,
+            start_session,
+        ]);
+        let mut conversation = Conversation::new(GreetdBackend::over(stream), "apost");
+        settle(&mut conversation);
+        conversation.type_into("dummy".into());
+        conversation.submit();
+        settle(&mut conversation);
+        assert!(conversation.state().is_authenticated(), "the fixture must log in first");
+        conversation.backend().launch(vec!["true".into()], Vec::new());
+        (conversation, server)
+    }
+
+    fn wait_for_launch(backend: &mut GreetdBackend) -> Launch {
+        let giving_up_at = std::time::Instant::now() + ANSWER_WITHIN;
+        while std::time::Instant::now() < giving_up_at {
+            match backend.launched() {
+                Launch::Waiting if !backend.connection_lost() => std::thread::sleep(std::time::Duration::from_millis(5)),
+                other => return other,
+            }
+        }
+        panic!("the launch never settled in {ANSWER_WITHIN:?}");
+    }
+
+    /// The greeter exits only once greetd has taken `StartSession`. It
+    /// used to post the request and exit in the same breath, racing the
+    /// thread that was to send it.
+    #[test]
+    fn a_launch_is_started_only_once_greetd_has_taken_it() {
+        let (mut conversation, server) = log_in_and_launch(Greetd::Success);
+        assert_eq!(wait_for_launch(conversation.backend()), Launch::Started);
+        let seen = server.join().expect("server thread");
+        assert!(
+            matches!(seen.last(), Some(Request::StartSession { cmd, .. }) if cmd == &["true".to_string()]),
+            "the session was never asked for"
+        );
+    }
+
+    /// A refusal is something to show, not a reason to exit as though
+    /// the session had started.
+    #[test]
+    fn a_launch_greetd_refuses_is_reported_rather_than_exited_on() {
+        let (mut conversation, _server) = log_in_and_launch(Greetd::Error {
+            error_type: ErrorType::Error,
+            description: "no such session".into(),
+        });
+        match wait_for_launch(conversation.backend()) {
+            Launch::Refused(reason) => assert!(reason.contains("no such session"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!conversation.backend().connection_lost(), "a refusal is an answer; the connection is fine");
+    }
+
+    /// A launch greetd never answers is bounded, and counts as the
+    /// connection lost: the thread is still inside that exchange, so the
+    /// socket cannot be trusted with another request.
+    #[test]
+    fn a_launch_greetd_never_answers_counts_as_the_connection_lost() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let client = UnixStream::connect(&path).expect("connect");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Cancel, then create: both answered, the second with a
+            // straight success (autologin's shape). The launch is read
+            // and never answered.
+            for reply in [
+                Greetd::Error { error_type: ErrorType::Error, description: "nothing to cancel".into() },
+                Greetd::Success,
+            ] {
+                Request::read_from(&mut stream).expect("a request");
+                reply.write_to(&mut stream).expect("a reply");
+            }
+            let _ = Request::read_from(&mut stream);
+            let _ = released.recv();
+        });
+
+        let mut conversation = Conversation::new(GreetdBackend::over(client), "apost");
+        settle(&mut conversation);
+        assert!(conversation.state().is_authenticated());
+        conversation.backend().launch_within(vec!["true".into()], Vec::new(), std::time::Duration::from_millis(50));
+        assert_eq!(wait_for_launch(conversation.backend()), Launch::Waiting);
+        assert!(conversation.backend().connection_lost());
+
+        drop(release);
+        server.join().expect("server thread");
     }
 
     /// greetd going away must not hang the login screen, which would be
