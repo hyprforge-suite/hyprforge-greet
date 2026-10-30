@@ -91,9 +91,15 @@ hl.config({
         gaps_out = 0,
         border_size = 0,
     },
-    decoration = {
-        rounding = 0,
-    },
+    -- No `decoration` block, and that is load-bearing. `rounding = 0` is
+    -- the default, so it looked like documentation; but setting any
+    -- `decoration:` rounding or blur option schedules a blur-framebuffer
+    -- refresh that allocates one for *every* enabled monitor. Hyprland
+    -- 0.57 enables a connected output whose mode list is empty (a dock's
+    -- fourth screen that the link cannot drive) at 0x0, and that
+    -- allocation asserts — so the login screen crash-looped on boot
+    -- until start-hyprland gave up and fell back to safe mode. Without
+    -- the option there is no refresh, and the empty output is harmless.
     animations = {
         -- A login screen that animates in is a login screen that is
         -- slower to appear.
